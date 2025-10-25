@@ -1,0 +1,286 @@
+stages:
+  - list
+  - validate
+  - prepare-ecr
+  - mirror
+
+variables:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCOUNT_ID: "123456789012"
+  IMAGE_CONFIG_FILE: "images.txt"
+  ECR_MIRROR_VERSION: "1.0.0"
+
+# Stage 1: List current ECR contents
+list_ecr_contents:
+  stage: list
+  image: amazon/aws-cli:latest
+  
+  before_script:
+    # Install dependencies
+    - yum install -y wget tar gzip
+    
+    # Install skopeo
+    - wget https://github.com/lework/skopeo-binary/releases/download/v1.13.0/skopeo-linux-amd64 -O /usr/local/bin/skopeo
+    - chmod +x /usr/local/bin/skopeo
+    
+    # Download ecr-mirror tool
+    - wget https://raw.githubusercontent.com/your-org/your-repo/main/ecr-mirror -O /usr/local/bin/ecr-mirror
+    - chmod +x /usr/local/bin/ecr-mirror
+    
+    # Verify installation
+    - aws --version
+    - skopeo --version
+    - ecr-mirror version
+  
+  script:
+    - |
+      echo "=========================================="
+      echo "Current ECR Contents"
+      echo "=========================================="
+      ecr-mirror list --region $AWS_DEFAULT_REGION
+  
+  only:
+    - main
+    - merge_requests
+  
+  allow_failure: true
+
+# Stage 2: Validate configuration file
+validate_config:
+  stage: validate
+  image: alpine:latest
+  
+  script:
+    - |
+      echo "=========================================="
+      echo "Validating Configuration"
+      echo "=========================================="
+      
+      if [ ! -f "$IMAGE_CONFIG_FILE" ]; then
+        echo "ERROR: $IMAGE_CONFIG_FILE not found"
+        exit 1
+      fi
+      
+      echo "✓ Configuration file exists: $IMAGE_CONFIG_FILE"
+      echo ""
+      
+      # Validate format
+      echo "Checking image format..."
+      line_num=0
+      error_count=0
+      
+      while IFS= read -r line; do
+        line_num=$((line_num + 1))
+        
+        # Skip comments and empty lines
+        [[ "$line" =~ ^#.*$ ]] && continue
+        [[ -z "$line" ]] && continue
+        
+        # Validate format: image:tag
+        if ! echo "$line" | grep -qE '^[a-zA-Z0-9/_.-]+:[a-zA-Z0-9_.-]+$'; then
+          echo "ERROR: Line $line_num invalid format: $line"
+          error_count=$((error_count + 1))
+        else
+          echo "✓ Line $line_num: $line"
+        fi
+      done < "$IMAGE_CONFIG_FILE"
+      
+      echo ""
+      echo "=========================================="
+      echo "Validation Summary"
+      echo "=========================================="
+      
+      if [ $error_count -gt 0 ]; then
+        echo "✗ Found $error_count errors"
+        exit 1
+      else
+        echo "✓ All images validated successfully"
+      fi
+  
+  only:
+    - main
+    - merge_requests
+  
+  artifacts:
+    paths:
+      - $IMAGE_CONFIG_FILE
+    expire_in: 1 hour
+
+# Stage 3: Prepare ECR repositories (AWS tasks only)
+prepare_ecr_repositories:
+  stage: prepare-ecr
+  image: amazon/aws-cli:latest
+  
+  before_script:
+    # Verify AWS credentials
+    - aws sts get-caller-identity
+  
+  script:
+    - |
+      echo "=========================================="
+      echo "Preparing ECR Repositories"
+      echo "=========================================="
+      echo "Region: $AWS_DEFAULT_REGION"
+      echo "Account: $AWS_ACCOUNT_ID"
+      echo ""
+      
+      # Get ECR login password
+      echo "Getting ECR credentials..."
+      aws ecr get-login-password --region $AWS_DEFAULT_REGION > ecr-password.txt
+      echo "✓ ECR credentials saved"
+      echo ""
+      
+      # Process each image and create repositories
+      echo "Creating ECR repositories..."
+      grep -v '^#' $IMAGE_CONFIG_FILE | grep -v '^$' | while IFS= read -r image_tag; do
+        echo "----------------------------------------"
+        echo "Processing: $image_tag"
+        
+        # Parse image (using sed instead of rev)
+        PUBLIC_IMAGE=$(echo "$image_tag" | sed 's/:[^:]*$//')
+        IMAGE_TAG=$(echo "$image_tag" | sed 's/.*://')
+        
+        # Determine ECR repository name
+        if echo "$PUBLIC_IMAGE" | grep -q '/'; then
+          if echo "$PUBLIC_IMAGE" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}(/|:)'; then
+            PATH_PART=$(echo "$PUBLIC_IMAGE" | sed -E 's|^[a-z0-9.-]+\.[a-z]{2,}[:/]||')
+          else
+            PATH_PART="$PUBLIC_IMAGE"
+          fi
+          REPO_NAME=$(echo "$PATH_PART" | tr '/' '-')
+        else
+          REPO_NAME="$PUBLIC_IMAGE"
+        fi
+        
+        echo "  ECR Repository: $REPO_NAME"
+        
+        # Check if repository exists
+        if aws ecr describe-repositories \
+          --repository-names $REPO_NAME \
+          --region $AWS_DEFAULT_REGION 2>/dev/null; then
+          echo "  ✓ Repository already exists"
+        else
+          # Create repository
+          echo "  Creating repository..."
+          aws ecr create-repository \
+            --repository-name $REPO_NAME \
+            --region $AWS_DEFAULT_REGION \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 \
+            --tags Key=ManagedBy,Value=GitLabCI Key=Source,Value=PublicImage Key=Pipeline,Value=$CI_PIPELINE_ID
+          
+          # Set lifecycle policy
+          echo "  Setting lifecycle policy..."
+          aws ecr put-lifecycle-policy \
+            --repository-name $REPO_NAME \
+            --region $AWS_DEFAULT_REGION \
+            --lifecycle-policy-text '{
+              "rules": [{
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }]
+            }'
+          
+          echo "  ✓ Repository created successfully"
+        fi
+        
+        echo ""
+      done
+      
+      echo "=========================================="
+      echo "✓ All ECR repositories ready"
+      echo "✓ ECR credentials prepared for next stage"
+      echo "=========================================="
+  
+  dependencies:
+    - validate_config
+  
+  only:
+    - main
+    - schedules
+  
+  artifacts:
+    paths:
+      - ecr-password.txt
+      - $IMAGE_CONFIG_FILE
+    expire_in: 1 hour
+
+# Stage 4: Mirror images using ecr-mirror CLI
+mirror_images:
+  stage: mirror
+  image: quay.io/skopeo/stable:latest
+  
+  before_script:
+    # Install dependencies
+    - apk add --no-cache bash wget aws-cli
+    
+    # Download ecr-mirror tool
+    - wget https://raw.githubusercontent.com/your-org/your-repo/main/ecr-mirror -O /usr/local/bin/ecr-mirror
+    - chmod +x /usr/local/bin/ecr-mirror
+    
+    # Verify artifacts from previous stage
+    - |
+      if [ ! -f ecr-password.txt ]; then
+        echo "ERROR: ECR password not found"
+        exit 1
+      fi
+      
+      if [ ! -f $IMAGE_CONFIG_FILE ]; then
+        echo "ERROR: $IMAGE_CONFIG_FILE not found"
+        exit 1
+      fi
+    
+    # Set up AWS credentials for ecr-mirror
+    - export AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID
+    - export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION
+    
+    # Verify AWS authentication
+    - aws sts get-caller-identity
+    
+    # Verify tools
+    - skopeo --version
+    - aws --version
+    - ecr-mirror version
+    
+    echo ""
+    echo "✓ All tools ready"
+    echo "✓ Artifacts verified"
+  
+  script:
+    - |
+      echo "=========================================="
+      echo "Mirroring Images to ECR"
+      echo "=========================================="
+      echo "Using ecr-mirror CLI tool"
+      echo ""
+      
+      # Use ecr-mirror to sync images
+      ecr-mirror mirror $IMAGE_CONFIG_FILE --account $AWS_ACCOUNT_ID --region $AWS_DEFAULT_REGION
+  
+  dependencies:
+    - prepare_ecr_repositories
+  
+  only:
+    - main
+    - schedules
+  
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  
+  after_script:
+    # List final ECR contents using ecr-mirror
+    - |
+      echo ""
+      echo "=========================================="
+      echo "Final ECR Contents"
+      echo "=========================================="
+      ecr-mirror list --region $AWS_DEFAULT_REGION || true

@@ -1,0 +1,274 @@
+stages:
+  - validate
+  - prepare-ecr
+  - mirror
+
+variables:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCOUNT_ID: "123456789012"
+  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+  IMAGE_CONFIG_FILE: "images.txt"
+
+# Validate configuration
+validate_config:
+  stage: validate
+  image: alpine:latest
+  script:
+    - |
+      if [ ! -f "$IMAGE_CONFIG_FILE" ]; then
+        echo "ERROR: $IMAGE_CONFIG_FILE not found"
+        exit 1
+      fi
+      
+      echo "Validating image configuration..."
+      grep -v '^#' $IMAGE_CONFIG_FILE | grep -v '^$' | while IFS= read -r line; do
+        if ! echo "$line" | grep -qE '^[a-zA-Z0-9/_.-]+:[a-zA-Z0-9_.-]+$'; then
+          echo "ERROR: Invalid format in line: $line"
+          exit 1
+        fi
+      done
+      
+      echo "✓ Configuration validated"
+  only:
+    - main
+    - merge_requests
+
+# Stage 1: Create ECR repositories and get credentials
+# All AWS operations happen here
+prepare_ecr_repositories:
+  stage: prepare-ecr
+  image: amazon/aws-cli:latest
+  
+  script:
+    - |
+      echo "=== AWS ECR Preparation ==="
+      echo ""
+      
+      # Verify AWS credentials
+      echo "Verifying AWS credentials..."
+      aws sts get-caller-identity
+      echo ""
+      
+      # Get ECR login password for skopeo to use
+      echo "Getting ECR login credentials..."
+      aws ecr get-login-password --region $AWS_DEFAULT_REGION > ecr-password.txt
+      echo "✓ ECR credentials saved"
+      echo ""
+      
+      # Process each image and create repositories
+      echo "Creating ECR repositories..."
+      grep -v '^#' $IMAGE_CONFIG_FILE | grep -v '^$' | while IFS= read -r image_tag; do
+        echo "----------------------------------------"
+        echo "Processing: $image_tag"
+        
+        # Parse image and tag using sed/awk instead of rev
+        # Extract everything before the last ':'
+        PUBLIC_IMAGE=$(echo "$image_tag" | sed 's/:[^:]*$//')
+        # Extract everything after the last ':'
+        IMAGE_TAG=$(echo "$image_tag" | sed 's/.*://')
+        
+        # Determine ECR repository name
+        if echo "$PUBLIC_IMAGE" | grep -q '/'; then
+          if echo "$PUBLIC_IMAGE" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}(/|:)'; then
+            PATH_PART=$(echo "$PUBLIC_IMAGE" | sed -E 's|^[a-z0-9.-]+\.[a-z]{2,}[:/]||')
+          else
+            PATH_PART="$PUBLIC_IMAGE"
+          fi
+          REPO_NAME=$(echo "$PATH_PART" | tr '/' '-')
+        else
+          REPO_NAME="$PUBLIC_IMAGE"
+        fi
+        
+        echo "  ECR Repository: $REPO_NAME"
+        
+        # Check if repository exists
+        if aws ecr describe-repositories \
+          --repository-names $REPO_NAME \
+          --region $AWS_DEFAULT_REGION 2>/dev/null; then
+          echo "  ✓ Repository already exists"
+        else
+          # Create repository
+          echo "  Creating repository..."
+          aws ecr create-repository \
+            --repository-name $REPO_NAME \
+            --region $AWS_DEFAULT_REGION \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 \
+            --tags Key=ManagedBy,Value=GitLabCI Key=Source,Value=PublicImage
+          
+          # Set lifecycle policy
+          echo "  Setting lifecycle policy..."
+          aws ecr put-lifecycle-policy \
+            --repository-name $REPO_NAME \
+            --region $AWS_DEFAULT_REGION \
+            --lifecycle-policy-text '{
+              "rules": [{
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }]
+            }'
+          
+          echo "  ✓ Repository created successfully"
+        fi
+        
+        echo ""
+      done
+      
+      echo "=========================================="
+      echo "✓ All ECR repositories ready"
+      echo "✓ ECR credentials prepared for next stage"
+      echo "=========================================="
+  
+  only:
+    - main
+    - schedules
+  
+  artifacts:
+    paths:
+      - ecr-password.txt
+      - $IMAGE_CONFIG_FILE
+    expire_in: 1 hour
+
+# Stage 2: Mirror images using ONLY Skopeo
+# No AWS CLI here - pure image copying only
+mirror_images:
+  stage: mirror
+  image: quay.io/skopeo/stable:latest
+  
+  before_script:
+    - |
+      echo "=== Skopeo Image Mirror Stage ==="
+      echo "No AWS CLI needed - pure image copying only"
+      echo ""
+      
+      # Verify artifacts from previous stage
+      if [ ! -f ecr-password.txt ]; then
+        echo "ERROR: ECR password not found"
+        exit 1
+      fi
+      
+      if [ ! -f $IMAGE_CONFIG_FILE ]; then
+        echo "ERROR: $IMAGE_CONFIG_FILE not found"
+        exit 1
+      fi
+      
+      echo "✓ ECR credentials available"
+      echo "✓ Image list available"
+      echo ""
+      
+      # Verify skopeo is available
+      skopeo --version
+      echo ""
+  
+  script:
+    - |
+      SUCCESS_COUNT=0
+      FAIL_COUNT=0
+      FAILED_IMAGES=""
+      
+      echo "Starting image mirroring with skopeo..."
+      echo ""
+      
+      # Read images from config file
+      grep -v '^#' $IMAGE_CONFIG_FILE | grep -v '^$' | while IFS= read -r image_tag; do
+        echo "=========================================="
+        echo "Processing: $image_tag"
+        echo "=========================================="
+        
+        # Parse image and tag using sed instead of rev
+        # Extract everything before the last ':'
+        PUBLIC_IMAGE=$(echo "$image_tag" | sed 's/:[^:]*$//')
+        # Extract everything after the last ':'
+        IMAGE_TAG=$(echo "$image_tag" | sed 's/.*://')
+        
+        # Determine ECR repository name (same logic as stage 1)
+        if echo "$PUBLIC_IMAGE" | grep -q '/'; then
+          if echo "$PUBLIC_IMAGE" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}(/|:)'; then
+            PATH_PART=$(echo "$PUBLIC_IMAGE" | sed -E 's|^[a-z0-9.-]+\.[a-z]{2,}[:/]||')
+          else
+            PATH_PART="$PUBLIC_IMAGE"
+          fi
+          REPO_NAME=$(echo "$PATH_PART" | tr '/' '-')
+        else
+          REPO_NAME="$PUBLIC_IMAGE"
+        fi
+        
+        ECR_REPO="$ECR_REGISTRY/$REPO_NAME"
+        
+        echo "Public Image: $PUBLIC_IMAGE:$IMAGE_TAG"
+        echo "ECR Repository: $REPO_NAME"
+        echo "ECR Destination: $ECR_REPO:$IMAGE_TAG"
+        echo ""
+        
+        # Determine source registry format
+        if echo "$PUBLIC_IMAGE" | grep -q '^docker\.io/'; then
+          SOURCE_IMAGE="docker://$PUBLIC_IMAGE:$IMAGE_TAG"
+        elif echo "$PUBLIC_IMAGE" | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}/'; then
+          # Has registry prefix (quay.io, gcr.io, public.ecr.aws, etc.)
+          SOURCE_IMAGE="docker://$PUBLIC_IMAGE:$IMAGE_TAG"
+        else
+          # No registry prefix - assume Docker Hub
+          SOURCE_IMAGE="docker://docker.io/$PUBLIC_IMAGE:$IMAGE_TAG"
+        fi
+        
+        DEST_IMAGE="docker://$ECR_REPO:$IMAGE_TAG"
+        
+        echo "Copying with skopeo..."
+        echo "  Source: $SOURCE_IMAGE"
+        echo "  Dest:   $DEST_IMAGE"
+        echo ""
+        
+        # Copy image with skopeo (pure image copy - no AWS CLI!)
+        if skopeo copy \
+          --src-no-creds \
+          --dest-creds AWS:$(cat ecr-password.txt) \
+          --override-os linux \
+          --override-arch amd64 \
+          --retry-times 3 \
+          "$SOURCE_IMAGE" \
+          "$DEST_IMAGE"; then
+          
+          SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          echo "✓ Successfully mirrored $PUBLIC_IMAGE:$IMAGE_TAG"
+        else
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+          FAILED_IMAGES="$FAILED_IMAGES\n  - $image_tag"
+          echo "✗ Failed to mirror $PUBLIC_IMAGE:$IMAGE_TAG"
+        fi
+        
+        echo ""
+      done
+      
+      # Summary
+      echo "=========================================="
+      echo "MIRROR SUMMARY"
+      echo "=========================================="
+      echo "Successful: $SUCCESS_COUNT"
+      echo "Failed: $FAIL_COUNT"
+      
+      if [ $FAIL_COUNT -gt 0 ]; then
+        echo -e "\nFailed images:$FAILED_IMAGES"
+        exit 1
+      fi
+      
+      echo ""
+      echo "✓ All images mirrored successfully!"
+  
+  dependencies:
+    - prepare_ecr_repositories
+  
+  only:
+    - main
+    - schedules
+  
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
