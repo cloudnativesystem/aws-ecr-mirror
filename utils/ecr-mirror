@@ -16,7 +16,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-AWS_REGION="${AWS_DEFAULT_REGION:-us-west-2}"
+AWS_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 ECR_REGISTRY=""
 
@@ -552,12 +552,19 @@ mirror_from_file() {
         print_success "ECR credentials obtained"
     fi
     
-    # Read images from file
+    # Read images from file and process
     local success_count=0
     local fail_count=0
     local skip_count=0
     
-    while IFS= read -r line; do
+    # Read file into array to avoid subshell issues
+    local lines=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        lines+=("$line")
+    done < "$file"
+    
+    # Process each line
+    for line in "${lines[@]}"; do
         # Skip comments and empty lines
         [[ "$line" =~ ^#.*$ ]] && continue
         [[ -z "$line" ]] && continue
@@ -574,8 +581,7 @@ mirror_from_file() {
         else
             fail_count=$((fail_count + 1))
         fi
-        
-    done < "$file"
+    done
     
     # Summary
     echo ""
