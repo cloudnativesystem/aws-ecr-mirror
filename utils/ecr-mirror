@@ -104,6 +104,69 @@ check_dependencies() {
         echo "  Skopeo: https://github.com/containers/skopeo"
         exit 1
     fi
+    
+    # Setup Skopeo policy if needed
+    setup_skopeo_policy
+}
+
+# Setup Skopeo policy configuration
+setup_skopeo_policy() {
+    local policy_dir="/etc/containers"
+    local policy_file="$policy_dir/policy.json"
+    
+    # Check if policy file exists
+    if [ -f "$policy_file" ]; then
+        return 0
+    fi
+    
+    # Try to create in /etc/containers (system-wide)
+    if [ -w "$policy_dir" ] || [ -w "/etc" ]; then
+        mkdir -p "$policy_dir" 2>/dev/null || true
+        if [ -w "$policy_dir" ] || [ -w "/etc" ]; then
+            cat > "$policy_file" 2>/dev/null << 'EOF'
+{
+  "default": [
+    {
+      "type": "insecureAcceptAnything"
+    }
+  ],
+  "transports": {
+    "docker-daemon": {
+      "": [{"type": "insecureAcceptAnything"}]
+    }
+  }
+}
+EOF
+            if [ -f "$policy_file" ]; then
+                return 0
+            fi
+        fi
+    fi
+    
+    # Fallback: Create in user's home directory
+    local user_policy_dir="$HOME/.config/containers"
+    local user_policy_file="$user_policy_dir/policy.json"
+    
+    mkdir -p "$user_policy_dir"
+    cat > "$user_policy_file" << 'EOF'
+{
+  "default": [
+    {
+      "type": "insecureAcceptAnything"
+    }
+  ],
+  "transports": {
+    "docker-daemon": {
+      "": [{"type": "insecureAcceptAnything"}]
+    }
+  }
+}
+EOF
+    
+    # Set environment variable to use user policy
+    export REGISTRY_AUTH_FILE="$user_policy_dir/policy.json"
+    
+    print_info "Created Skopeo policy at: $user_policy_file"
 }
 
 # Verify AWS credentials
@@ -499,8 +562,21 @@ mirror_image() {
     echo "  To:   $dest_image"
     echo ""
     
+    # Ensure policy file exists for this operation
+    local policy_file=""
+    if [ -f "/etc/containers/policy.json" ]; then
+        policy_file="/etc/containers/policy.json"
+    elif [ -f "$HOME/.config/containers/policy.json" ]; then
+        policy_file="$HOME/.config/containers/policy.json"
+    fi
+    
     # Copy with skopeo
-    if skopeo copy \
+    local skopeo_cmd="skopeo copy"
+    if [ -n "$policy_file" ]; then
+        skopeo_cmd="skopeo copy --policy $policy_file"
+    fi
+    
+    if $skopeo_cmd \
         --src-no-creds \
         --dest-creds "AWS:$ecr_password" \
         --override-os linux \
